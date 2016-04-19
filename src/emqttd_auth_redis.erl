@@ -25,17 +25,29 @@
 
 -record(state, {auth_cmd, hash_type}).
 
+-define(AUTH_CLIENTID_TAB, mqtt_auth_clientid).
+
+-record(?AUTH_CLIENTID_TAB, {client_id, ipaddr, password}).
+
 -define(UNDEFINED(S), (S =:= undefined orelse S =:= <<>>)).
 
-init({AuthCmd, HashType}) -> 
+init({AuthCmd, HashType, ClientsFile}) ->
+    mnesia:create_table(?AUTH_CLIENTID_TAB, [
+            {ram_copies, [node()]},
+            {attributes, record_info(fields, ?AUTH_CLIENTID_TAB)}]),
+    mnesia:add_table_copy(?AUTH_CLIENTID_TAB, node(), ram_copies),
+    load(ClientsFile),
     {ok, #state{auth_cmd = AuthCmd, hash_type = HashType}}.
 
-check(#mqtt_client{username = Username}, Password, _State)
+%% Try to auth by client_id
+check(#mqtt_client{username = Username, client_id = ClientId, peername = {IpAddress, _}}, Password, _State)
     when ?UNDEFINED(Username) orelse ?UNDEFINED(Password) ->
-    {error, username_or_passwd_undefined};
+    lager:debug("Client auth: ~s, ip ~s", [ClientId, inet_parse:ntoa(IpAddress)]),
+    check_clientid_only(ClientId, IpAddress);
 
 check(#mqtt_client{username = Username}, Password,
       #state{auth_cmd = AuthCmd, hash_type = HashType}) ->
+    lager:debug("Redis auth ~s", [Username]),
     case emqttd_redis_client:query(repl_var(AuthCmd, Username)) of
         {ok, undefined} ->
             {error, not_found};
@@ -58,4 +70,62 @@ hash(Type, Password) ->
 
 repl_var(AuthCmd, Username) ->
     [re:replace(Token, "%u", Username, [global, {return, binary}]) || Token <- AuthCmd].
+
+%%--------------------------------------------------------------------
+%% Internal functions
+%%--------------------------------------------------------------------
+
+load(undefined) ->
+    ok;
+
+load(File) ->
+    {ok, Fd} = file:open(File, [read]),
+    load(Fd, file:read_line(Fd), []).
+
+load(Fd, {ok, Line}, Clients) when is_list(Line) ->
+    Clients1 =
+    case string:tokens(Line, " ") of
+        [ClientIdS] ->
+            ClientId = list_to_binary(string:strip(ClientIdS, right, $\n)),
+            [#mqtt_auth_clientid{client_id = ClientId} | Clients];
+        [ClientId, IpAddr0] ->
+            IpAddr = string:strip(IpAddr0, right, $\n),
+            Range = esockd_access:range(IpAddr),
+            [#mqtt_auth_clientid{client_id = list_to_binary(ClientId),
+                                 ipaddr = {IpAddr, Range}}|Clients];
+        BadLine ->
+            lager:error("BadLine in clients.config: ~s", [BadLine]),
+            Clients
+    end,
+    load(Fd, file:read_line(Fd), Clients1);
+
+load(Fd, eof, Clients) ->
+    mnesia:transaction(fun() -> [mnesia:write(C) || C<- Clients] end),
+    file:close(Fd).
+
+check_clientid_only(ClientId, IpAddr) ->
+	%% Split client by # and authenticate only by first part
+	%% E.g. Client id "SomeService#uniqueid" authenticates as "SomeService"
+    ClientString = binary_to_list(ClientId),
+    case string:tokens(ClientString, "#") of
+        [ClientId2, _Suffix] ->
+            check_clientid_only2(list_to_binary(ClientId2), IpAddr);
+        [ClientId2] ->
+            check_clientid_only2(list_to_binary(ClientId2), IpAddr);
+        _ ->
+            check_clientid_only2(ClientId, IpAddr)
+    end.
+
+check_clientid_only2(ClientId, IpAddr) ->
+    %% lager:error("Authenticate against client id: ~s", [ClientId]),
+    case mnesia:dirty_read(?AUTH_CLIENTID_TAB, ClientId) of
+        [] -> {error, clientid_not_found};
+        [#?AUTH_CLIENTID_TAB{ipaddr = undefined}]  -> ok;
+        [#?AUTH_CLIENTID_TAB{ipaddr = {_, {Start, End}}}] ->
+            I = esockd_access:atoi(IpAddr),
+            case I >= Start andalso I =< End of
+                true  -> ok;
+                false -> {error, wrong_ipaddr}
+            end
+    end.
 

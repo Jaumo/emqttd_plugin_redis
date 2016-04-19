@@ -31,8 +31,9 @@
 
 %% Called when the plugin loaded
 load() ->
+	lager:error("Init authcmd=~s, clienst_file=~s", [env(authcmd), env(clients_file)]),
     ok = emqttd_access_control:register_mod(
-            auth, emqttd_auth_redis, {env(authcmd), env(password_hash)}),
+            auth, emqttd_auth_redis, {env(authcmd), env(password_hash), env(clients_file)}),
     with_cmd_enabled(aclcmd, fun(AclCmd) ->
             ok = emqttd_access_control:register_mod(acl, emqttd_acl_redis, {AclCmd, env(acl_nomatch)})
         end),

@@ -30,11 +30,18 @@
 
 -define(IS_SUB(PubSub), PubSub =:= subscribe orelse PubSub =:= pubsub).
 
+-define(UNDEFINED(S), (S =:= undefined orelse S =:= <<>>)).
+
 init({AclCmd, AclNomatch}) ->
     {ok, #state{acl_cmd = AclCmd, acl_nomatch = AclNomatch}}.
 
 check_acl({#mqtt_client{username = <<$$, _/binary>>}, _PubSub, _Topic}, _State) ->
     {error, bad_username};
+
+%% Client authenticated by client id can sub/pub to all topics
+check_acl({#mqtt_client{username = Username}, _PubSub, _Topic}, _State)
+    when ?UNDEFINED(Username) ->
+    allow;
 
 check_acl({Client, PubSub, Topic}, #state{acl_cmd     = AclCmd,
                                           acl_nomatch = Default}) ->
