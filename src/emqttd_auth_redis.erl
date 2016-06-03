@@ -23,7 +23,7 @@
 
 -export([init/1, check/3, description/0]).
 
--record(state, {auth_cmd, hash_type}).
+-record(state, {super_cmd, auth_cmd, hash_type}).
 
 -define(AUTH_CLIENTID_TAB, mqtt_auth_clientid).
 
@@ -31,13 +31,13 @@
 
 -define(UNDEFINED(S), (S =:= undefined orelse S =:= <<>>)).
 
-init({AuthCmd, HashType, ClientsFile}) ->
+init({SuperCmd, AuthCmd, HashType, ClientsFile}) ->
     mnesia:create_table(?AUTH_CLIENTID_TAB, [
             {ram_copies, [node()]},
             {attributes, record_info(fields, ?AUTH_CLIENTID_TAB)}]),
     mnesia:add_table_copy(?AUTH_CLIENTID_TAB, node(), ram_copies),
     load(ClientsFile),
-    {ok, #state{auth_cmd = AuthCmd, hash_type = HashType}}.
+    {ok, #state{super_cmd = SuperCmd, auth_cmd = AuthCmd, hash_type = HashType}}.
 
 %% Try to auth by client_id
 check(#mqtt_client{username = Username, client_id = ClientId, peername = {IpAddress, _}}, Password, _State)
@@ -45,19 +45,21 @@ check(#mqtt_client{username = Username, client_id = ClientId, peername = {IpAddr
     lager:debug("Client auth: ~s, ip ~s", [ClientId, inet_parse:ntoa(IpAddress)]),
     check_clientid_only(ClientId, IpAddress);
 
-check(#mqtt_client{username = Username}, Password,
-      #state{auth_cmd = AuthCmd, hash_type = HashType}) ->
-    lager:debug("Redis auth ~s", [Username]),
-    case emqttd_redis_client:query(repl_var(AuthCmd, Username)) of
-        {ok, undefined} ->
-            {error, not_found};
-        {ok, HashPass} ->
-            check_pass(HashPass, Password, HashType);
-        {error, Error} ->
-            {error, Error}
+check(Client, Password, #state{super_cmd = SuperCmd,
+                               auth_cmd  = AuthCmd,
+                               hash_type = HashType}) ->
+    lager:debug("Redis auth ~s", [Client#mqtt_client.username]),
+    case emqttd_plugin_redis_client:is_superuser(SuperCmd, Client) of
+        false -> case emqttd_plugin_redis_client:query(AuthCmd, Client) of
+                     {ok, undefined} ->
+                         {error, not_found};
+                     {ok, HashPass} ->
+                         check_pass(HashPass, Password, HashType);
+                     {error, Error} ->
+                         {error, Error}
+                 end;
+        true  -> ok
     end.
-
-description() -> "Authentication with Redis".
 
 check_pass(PassHash, Password, HashType) ->
     case PassHash =:= hash(HashType, Password) of
@@ -68,8 +70,7 @@ check_pass(PassHash, Password, HashType) ->
 hash(Type, Password) ->
     emqttd_auth_mod:passwd_hash(Type, Password).
 
-repl_var(AuthCmd, Username) ->
-    [re:replace(Token, "%u", Username, [global, {return, binary}]) || Token <- AuthCmd].
+description() -> "Authentication with Redis".
 
 %%--------------------------------------------------------------------
 %% Internal functions
@@ -90,9 +91,8 @@ load(Fd, {ok, Line}, Clients) when is_list(Line) ->
             [#mqtt_auth_clientid{client_id = ClientId} | Clients];
         [ClientId, IpAddr0] ->
             IpAddr = string:strip(IpAddr0, right, $\n),
-            Range = esockd_access:range(IpAddr),
             [#mqtt_auth_clientid{client_id = list_to_binary(ClientId),
-                                 ipaddr = {IpAddr, Range}}|Clients];
+                                 ipaddr = esockd_cidr:parse(IpAddr, true)} | Clients];
         BadLine ->
             lager:error("BadLine in clients.config: ~s", [BadLine]),
             Clients
@@ -117,15 +117,15 @@ check_clientid_only(ClientId, IpAddr) ->
     end.
 
 check_clientid_only2(ClientId, IpAddr) ->
-    %% lager:error("Authenticate against client id: ~s", [ClientId]),
+    lager:info("Authenticate against client id: ~s", [ClientId]),
     case mnesia:dirty_read(?AUTH_CLIENTID_TAB, ClientId) of
-        [] -> {error, clientid_not_found};
-        [#?AUTH_CLIENTID_TAB{ipaddr = undefined}]  -> ok;
-        [#?AUTH_CLIENTID_TAB{ipaddr = {_, {Start, End}}}] ->
-            I = esockd_access:atoi(IpAddr),
-            case I >= Start andalso I =< End of
+        [] ->
+            {error, clientid_not_found};
+        [#?AUTH_CLIENTID_TAB{ipaddr = undefined}] ->
+            ok;
+        [#?AUTH_CLIENTID_TAB{ipaddr = CIDR}] ->
+            case esockd_cidr:match(IpAddr, CIDR) of
                 true  -> ok;
                 false -> {error, wrong_ipaddr}
             end
     end.
-
